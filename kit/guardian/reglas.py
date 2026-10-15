@@ -250,9 +250,10 @@ def comprobar_cifras(oracion, fuentes, fuentes_relevantes=None):
     anios = {c["valor"] for c in cifras_f if c["tipo"] == "anio"}
     fechas = {(c["valor"], c["mes"]) for c in cifras_f if c["tipo"] == "fecha"}
     res = {"cifra_nueva": 0.0, "cifra_no_derivable": 0.0, "cifra_dudosa": 0.0, "fecha_nueva": 0.0, "ratio_falso": 0.0,
-           "cifra_de_otra_fuente": 0.0}
+           "cifra_de_otra_fuente": 0.0, "cuenta_verificada": 0.0}
     tomadas = [x for x in cifras_or if x["tipo"] in ("num", "hora") and _cerca(x["valor"], literales, _tolerancia(x))]
     derivados = None
+    calculadas = 0
     for c in cifras_or:
         if c["tipo"] == "anio":
             if c["valor"] not in anios:
@@ -300,11 +301,15 @@ def comprobar_cifras(oracion, fuentes, fuentes_relevantes=None):
             res["cifra_no_derivable"] = 1.0
         elif not cerca:
             res["cifra_dudosa"] = 1.0
-        elif c.get("pct") and len(tomadas) >= 2:
+        elif c.get("pct") and len(tomadas) >= 2 and not _derivable(c, tol, (1,), _derivados([t["valor"] for t in tomadas], None)):
             # «812 de 1.326, más del 70 %»: el porcentaje debe salir de las cifras de la frase
-            locales = _derivados([t["valor"] for t in tomadas], None)
-            if not _derivable(c, tol, (1,), locales):
-                res["cifra_no_derivable"] = 1.0
+            res["cifra_no_derivable"] = 1.0
+        else:
+            calculadas += 1
+    # Pista POSITIVA: la oración hace cuentas y todas cuadran con las fuentes. El NLI
+    # no sabe hacer cuentas («suman 8 de los 15») y da poco respaldo a estas frases fieles.
+    if calculadas and not (res["cifra_no_derivable"] or res["cifra_dudosa"] or res["ratio_falso"]):
+        res["cuenta_verificada"] = 1.0
     return res
 
 
@@ -334,7 +339,8 @@ MATICES = {
     ),
     "condicion_perdida": (
         r"\bsi\b|\bsiempre que\b|\bsiempre y cuando\b|\ben caso de\b|\ba condicion de\b|\bcon la condicion\b|\bsalvo\b|\bexcepto\b|\ba excepcion\b|\ba menos que\b|\bsujet[oa]s? a\b|\bpendiente de\b|\bprevia\b|\bcondicionad",
-        r"\bsi\b|\bsiempre\b|\ben caso\b|\bcondici\w*|\bsalvo\b|\bexcept\w*|\ba menos\b|\bsujet\w*|\bpendiente\b|\bprevi[ao]\b|\brequisito\w*|\bcuando\b|\bmientras\b",
+        r"\bsi\b|\bsiempre\b|\ben caso\b|\bcondici\w*|\bsalvo\b|\bexcept\w*|\ba menos\b|\bsujet\w*|\bpendiente\b|\bprevi[ao]\b|\brequisito\w*|\bcuando\b|\bmientras\b"
+        r"|\bpara que\b|\bpara no\b|\bten(?:er|ia|ian|dra|dran|ga|gan|ido)? que\b|\btiene(?:n)? que\b|\bdeb\w*|\brequi\w*|\bexig\w*|\bnecesit\w*|\bunic[oa]s?\b|\bsino\b",
     ),
     "restriccion_perdida": (
         r"\bsolo\b|\bsolamente\b|\bunicamente\b|\bexclusivamente\b|\bnada mas\b",
@@ -529,6 +535,7 @@ def contenido_nuevo(oracion, fuentes, pregunta=""):
 # ---------------------------------------------------------------------------
 
 NOMBRES = ["cifra_nueva", "cifra_no_derivable", "cifra_dudosa", "fecha_nueva", "ratio_falso", "cifra_de_otra_fuente",
+           "cuenta_verificada",
            "modal_perdido", "condicion_perdida", "restriccion_perdida", "intencion_como_hecho", "aproximacion_perdida",
            "parcial_perdido", "universal_anadido", "modificador_omitido",
            "causa_anadida", "consecuencia_anadida", "palabras_nuevas", "racha_nueva"]
@@ -540,7 +547,7 @@ NOMBRES = ["cifra_nueva", "cifra_no_derivable", "cifra_dudosa", "fecha_nueva", "
 # escribieron editando poco la fuente. Es un atajo del formato: entrenado en H y
 # probado en el resto del train hunde la puntuación (de +0,54 a +0,14 con el
 # corte en 0,5), así que en el giro haría daño. Se calculan, pero no se usan.
-RECOMENDADAS = ["cifra_no_derivable", "cifra_dudosa", "ratio_falso",
+RECOMENDADAS = ["cifra_no_derivable", "cifra_dudosa", "ratio_falso", "cuenta_verificada",
                 "modal_perdido", "condicion_perdida", "restriccion_perdida", "intencion_como_hecho",
                 "aproximacion_perdida", "parcial_perdido", "modificador_omitido",
                 "causa_anadida", "consecuencia_anadida"]

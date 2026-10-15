@@ -1,12 +1,14 @@
-"""El Guardián: bot del equipo (P13, P, D, J). FICHERO GENERADO, no editar a mano.
+"""El Guardián: bot del equipo Syntax Terror (P13, P, D, J). FICHERO GENERADO, no editar a mano.
 
 Se genera con `python herramientas/montar_bot.py` (desde kit/) a partir de
 guardian/reglas.py (P), las señales de D (guardian/plantilla_bot.py) y los pesos
 aprendidos en los casos H. Solo usa la librería estándar.
 
 Cómo decide: señales del juez LLM y del NLI (peor oración) + reglas de verificación
-(cifras, matices, alcance, causas) -> regresión logística ponderada 4:1 -> score.
-El corte óptimo fuera de muestra (0.42) se ha desplazado a 0,5.
+(cifras, matices, alcance, causas; y cuentas que cuadran como pista a favor)
+-> regresión logística ponderada 4:1 -> score. Dos modelos según lo que traiga el caso
+(completo / sin juez LLM; sin señales, sospechoso). Cortes óptimos fuera de muestra desplazados
+a 0,5: completo 0.53, sin_llm 0.44.
 """
 
 # ===========================================================================
@@ -251,9 +253,10 @@ def comprobar_cifras(oracion, fuentes, fuentes_relevantes=None):
     anios = {c["valor"] for c in cifras_f if c["tipo"] == "anio"}
     fechas = {(c["valor"], c["mes"]) for c in cifras_f if c["tipo"] == "fecha"}
     res = {"cifra_nueva": 0.0, "cifra_no_derivable": 0.0, "cifra_dudosa": 0.0, "fecha_nueva": 0.0, "ratio_falso": 0.0,
-           "cifra_de_otra_fuente": 0.0}
+           "cifra_de_otra_fuente": 0.0, "cuenta_verificada": 0.0}
     tomadas = [x for x in cifras_or if x["tipo"] in ("num", "hora") and _cerca(x["valor"], literales, _tolerancia(x))]
     derivados = None
+    calculadas = 0
     for c in cifras_or:
         if c["tipo"] == "anio":
             if c["valor"] not in anios:
@@ -301,11 +304,15 @@ def comprobar_cifras(oracion, fuentes, fuentes_relevantes=None):
             res["cifra_no_derivable"] = 1.0
         elif not cerca:
             res["cifra_dudosa"] = 1.0
-        elif c.get("pct") and len(tomadas) >= 2:
+        elif c.get("pct") and len(tomadas) >= 2 and not _derivable(c, tol, (1,), _derivados([t["valor"] for t in tomadas], None)):
             # «812 de 1.326, más del 70 %»: el porcentaje debe salir de las cifras de la frase
-            locales = _derivados([t["valor"] for t in tomadas], None)
-            if not _derivable(c, tol, (1,), locales):
-                res["cifra_no_derivable"] = 1.0
+            res["cifra_no_derivable"] = 1.0
+        else:
+            calculadas += 1
+    # Pista POSITIVA: la oración hace cuentas y todas cuadran con las fuentes. El NLI
+    # no sabe hacer cuentas («suman 8 de los 15») y da poco respaldo a estas frases fieles.
+    if calculadas and not (res["cifra_no_derivable"] or res["cifra_dudosa"] or res["ratio_falso"]):
+        res["cuenta_verificada"] = 1.0
     return res
 
 
@@ -335,7 +342,8 @@ MATICES = {
     ),
     "condicion_perdida": (
         r"\bsi\b|\bsiempre que\b|\bsiempre y cuando\b|\ben caso de\b|\ba condicion de\b|\bcon la condicion\b|\bsalvo\b|\bexcepto\b|\ba excepcion\b|\ba menos que\b|\bsujet[oa]s? a\b|\bpendiente de\b|\bprevia\b|\bcondicionad",
-        r"\bsi\b|\bsiempre\b|\ben caso\b|\bcondici\w*|\bsalvo\b|\bexcept\w*|\ba menos\b|\bsujet\w*|\bpendiente\b|\bprevi[ao]\b|\brequisito\w*|\bcuando\b|\bmientras\b",
+        r"\bsi\b|\bsiempre\b|\ben caso\b|\bcondici\w*|\bsalvo\b|\bexcept\w*|\ba menos\b|\bsujet\w*|\bpendiente\b|\bprevi[ao]\b|\brequisito\w*|\bcuando\b|\bmientras\b"
+        r"|\bpara que\b|\bpara no\b|\bten(?:er|ia|ian|dra|dran|ga|gan|ido)? que\b|\btiene(?:n)? que\b|\bdeb\w*|\brequi\w*|\bexig\w*|\bnecesit\w*|\bunic[oa]s?\b|\bsino\b",
     ),
     "restriccion_perdida": (
         r"\bsolo\b|\bsolamente\b|\bunicamente\b|\bexclusivamente\b|\bnada mas\b",
@@ -530,6 +538,7 @@ def contenido_nuevo(oracion, fuentes, pregunta=""):
 # ---------------------------------------------------------------------------
 
 NOMBRES = ["cifra_nueva", "cifra_no_derivable", "cifra_dudosa", "fecha_nueva", "ratio_falso", "cifra_de_otra_fuente",
+           "cuenta_verificada",
            "modal_perdido", "condicion_perdida", "restriccion_perdida", "intencion_como_hecho", "aproximacion_perdida",
            "parcial_perdido", "universal_anadido", "modificador_omitido",
            "causa_anadida", "consecuencia_anadida", "palabras_nuevas", "racha_nueva"]
@@ -541,7 +550,7 @@ NOMBRES = ["cifra_nueva", "cifra_no_derivable", "cifra_dudosa", "fecha_nueva", "
 # escribieron editando poco la fuente. Es un atajo del formato: entrenado en H y
 # probado en el resto del train hunde la puntuación (de +0,54 a +0,14 con el
 # corte en 0,5), así que en el giro haría daño. Se calculan, pero no se usan.
-RECOMENDADAS = ["cifra_no_derivable", "cifra_dudosa", "ratio_falso",
+RECOMENDADAS = ["cifra_no_derivable", "cifra_dudosa", "ratio_falso", "cuenta_verificada",
                 "modal_perdido", "condicion_perdida", "restriccion_perdida", "intencion_como_hecho",
                 "aproximacion_perdida", "parcial_perdido", "modificador_omitido",
                 "causa_anadida", "consecuencia_anadida"]
@@ -618,64 +627,126 @@ def reglas_caso(caso, estricto=False):
 # SEÑALES (D) Y MODELO
 # ===========================================================================
 import math
+import unicodedata
 
+
+SENALES_LLM = ["llm_no_respaldada", "llm_contradicha", "llm_confianza_duda"]
+SENALES_NLI = ["nli_min_respaldo", "frag_min_respaldo"]
+# Fuera: nli_max_contradiccion y nli_respaldo_todas_min. En H no distinguen (AUROC ~0,5)
+# y el modelo les daba pesos con el signo al revés: era ruido.
+
+MODELOS = {
+    "completo": SENALES_LLM + SENALES_NLI + RECOMENDADAS,
+    "sin_llm": SENALES_NLI + RECOMENDADAS,
+}
+# Sin LLM ni NLI no hay modelo: uno «solo reglas» daba −0,05 fuera de H (peor que
+# marcarlo todo), así que en ese caso se marca como sospechoso (puntuación 0 asegurada).
+SIN_SENALES = 0.6
+
+
+def _veredicto(v):
+    """'Respaldada', 'NO RESPALDADA', 'no-respaldada'... -> respaldada / no_respaldada / contradicha / None."""
+    if not isinstance(v, str):
+        return None
+    v = "".join(c for c in unicodedata.normalize("NFD", v.strip().lower()) if unicodedata.category(c) != "Mn")
+    v = v.replace("-", "_").replace(" ", "_")
+    if v.startswith("contradic"):
+        return "contradicha"
+    if v.startswith(("no_resp", "no_sop", "sin_resp")):
+        return "no_respaldada"
+    if v.startswith("respald"):
+        return "respaldada"
+    return None
+
+
+def _num(x, defecto=0.0):
+    try:
+        x = float(x)
+        return x if x == x else defecto  # descarta NaN
+    except (TypeError, ValueError):
+        return defecto
+
+
+def _max(lista):
+    return max((_num(v) for v in (lista or [])), default=None)
 
 
 def caracteristicas_senales(caso):
-    """Señales de D (kit/guardian/senales.py), con dos fallos corregidos:
+    """Señales de D (kit/guardian/senales.py), con estos arreglos:
     - el original devolvía dentro del bucle y solo miraba la primera oración;
-    - con "confianza": null lanzaba una excepción.
-    Además añade llm_sin_veredicto (el juez no contestó).
+    - con "confianza": null lanzaba una excepción;
+    - veredictos normalizados (mayúsculas, tildes, espacios);
+    - si no hay oraciones se usan los fragmentos para el NLI.
+    Devuelve también qué hay disponible (hay_llm, hay_nli) para elegir modelo.
     """
-    oraciones = (caso.get("senales") or {}).get("oraciones") or []
-    fragmentos = (caso.get("senales") or {}).get("fragmentos") or []
-    if not oraciones:
-        return {"llm_no_respaldada": 0.5, "llm_contradicha": 0.0, "llm_confianza_duda": 0.5,
-                "llm_sin_veredicto": 1.0, "nli_min_respaldo": 0.0, "nli_max_contradiccion": 0.5,
-                "nli_respaldo_todas_min": 0.0, "frag_min_respaldo": 0.0}
-    no_resp = contra = duda = sin_ver = 0.0
-    min_resp = min_todas = 1.0
-    max_contra = 0.0
+    senales = caso.get("senales") or {}
+    oraciones = senales.get("oraciones") or []
+    fragmentos = senales.get("fragmentos") or []
+    no_resp = contra = duda = 0.0
+    hay_llm = False
+    min_resp = None
     for o in oraciones:
         llm = o.get("llm") or {}
-        ver = llm.get("veredicto")
-        conf = llm.get("confianza")
-        conf = 0.5 if conf is None else float(conf)
+        ver = _veredicto(llm.get("veredicto"))
+        # Sin confianza nos quedamos con el veredicto y una confianza típica: con 0,5 el
+        # bot veía una «duda» enorme en cada frase y lo marcaba todo.
+        conf = min(1.0, max(0.0, _num(llm.get("confianza"), 0.9)))
         if ver == "no_respaldada":
             no_resp = max(no_resp, conf)
         elif ver == "contradicha":
             contra = max(contra, conf)
         elif ver == "respaldada":
             duda = max(duda, 1.0 - conf)
-        else:
-            sin_ver = 1.0
-        min_resp = min(min_resp, max(o.get("respaldo_por_fuente") or [0.0]))
-        min_todas = min(min_todas, float(o.get("respaldo_todas") or 0.0))
-        max_contra = max(max_contra, max(o.get("contradiccion_por_fuente") or [0.0]),
-                         float(o.get("contradiccion_todas") or 0.0))
-    frag = min((max(f.get("respaldo_por_fuente") or [0.0]) for f in fragmentos), default=min_resp)
+        hay_llm = hay_llm or ver is not None
+        m = _max(o.get("respaldo_por_fuente"))
+        if m is not None:
+            min_resp = m if min_resp is None else min(min_resp, m)
+    frag = None
+    for f in fragmentos:
+        m = _max(f.get("respaldo_por_fuente"))
+        if m is not None:
+            frag = m if frag is None else min(frag, m)
+    if min_resp is None:
+        min_resp = frag
+    if frag is None:
+        frag = min_resp
+    hay_nli = min_resp is not None
     return {"llm_no_respaldada": no_resp, "llm_contradicha": contra, "llm_confianza_duda": duda,
-            "llm_sin_veredicto": sin_ver, "nli_min_respaldo": min_resp, "nli_max_contradiccion": max_contra,
-            "nli_respaldo_todas_min": min_todas, "frag_min_respaldo": frag}
+            "nli_min_respaldo": min_resp if hay_nli else 0.0, "frag_min_respaldo": frag if hay_nli else 0.0,
+            "hay_llm": hay_llm, "hay_nli": hay_nli}
 
 
 def caracteristicas(caso):
-    """Vector de entrada del modelo: señales de D + reglas recomendadas de P."""
-    s = caracteristicas_senales(caso)
-    r = reglas_caso(caso)
-    return [s[k] for k in NOMBRES_SENALES] + [r[k] for k in RECOMENDADAS]
+    """Todas las características del caso (señales de D + reglas de P) en un dict."""
+    d = caracteristicas_senales(caso)
+    d.update(reglas_caso(caso))
+    return d
 
 
-NOMBRES_SENALES = ["llm_no_respaldada", "llm_contradicha", "llm_confianza_duda", "llm_sin_veredicto",
-                   "nli_min_respaldo", "nli_max_contradiccion", "nli_respaldo_todas_min", "frag_min_respaldo"]
+def elegir_modelo(d):
+    if d["hay_llm"] and d["hay_nli"]:
+        return "completo"
+    return "sin_llm" if d["hay_nli"] else None
+
+
+def vector(d, modelo):
+    return [float(d[k]) for k in MODELOS[modelo]]
+
 
 # === PARAMETROS (los escribe herramientas/montar_bot.py) ===
 PARAMS = {
-    "nombres": ['llm_no_respaldada', 'llm_contradicha', 'llm_confianza_duda', 'llm_sin_veredicto', 'nli_min_respaldo', 'nli_max_contradiccion', 'nli_respaldo_todas_min', 'frag_min_respaldo', 'cifra_no_derivable', 'cifra_dudosa', 'ratio_falso', 'modal_perdido', 'condicion_perdida', 'restriccion_perdida', 'intencion_como_hecho', 'aproximacion_perdida', 'parcial_perdido', 'modificador_omitido', 'causa_anadida', 'consecuencia_anadida'],
-    "media": [0.059509, 0.127924, 0.030032, 0.001585, 0.409474, 0.571347, 0.349417, 0.484867, 0.050713, 0.045959, 0.00317, 0.064976, 0.090333, 0.063391, 0.034865, 0.00317, 0.052298, 0.045959, 0.049128, 0.011094],
-    "desv": [0.218582, 0.326624, 0.040087, 0.039778, 0.38843, 0.383873, 0.387646, 0.387036, 0.219411, 0.209396, 0.05621, 0.246484, 0.286658, 0.243666, 0.183439, 0.05621, 0.222627, 0.209396, 0.216136, 0.10474],
-    "coef": [0.809104, 1.417687, 0.598162, 0.207654, -0.193397, -0.175528, 0.118399, -0.368106, 0.67336, 0.21935, 0.088823, 0.53545, 0.450366, 0.450249, 0.213601, 0.122043, 0.516518, 0.392318, 0.153808, 0.071158],
-    "sesgo": 1.74011,  # ya desplazado: corte 0.42 -> 0,5
+    'completo': {  # corte 0.53 desplazado a 0,5
+        "media": [0.059509, 0.127924, 0.030032, 0.409474, 0.484867, 0.050713, 0.045959, 0.00317, 0.244057, 0.064976, 0.079239, 0.063391, 0.034865, 0.00317, 0.052298, 0.045959, 0.049128, 0.011094],
+        "desv": [0.218582, 0.326624, 0.040087, 0.38843, 0.387036, 0.219411, 0.209396, 0.05621, 0.429527, 0.246484, 0.270112, 0.243666, 0.183439, 0.05621, 0.222627, 0.209396, 0.216136, 0.10474],
+        "coef": [0.722554, 1.340793, 0.631684, -0.176356, -0.554745, 0.540641, 0.070281, 0.056413, -0.785944, 0.387702, 0.46382, 0.385374, 0.142622, 0.131769, 0.474411, 0.35346, 0.093844, 0.140709],
+        "sesgo": 1.243455,
+    },
+    'sin_llm': {  # corte 0.44 desplazado a 0,5
+        "media": [0.409474, 0.484867, 0.050713, 0.045959, 0.00317, 0.244057, 0.064976, 0.079239, 0.063391, 0.034865, 0.00317, 0.052298, 0.045959, 0.049128, 0.011094],
+        "desv": [0.38843, 0.387036, 0.219411, 0.209396, 0.05621, 0.429527, 0.246484, 0.270112, 0.243666, 0.183439, 0.05621, 0.222627, 0.209396, 0.216136, 0.10474],
+        "coef": [-0.477173, -0.49107, 0.479566, 0.024591, 0.015569, -0.868186, 0.317842, 0.373261, 0.33875, 0.186139, 0.213857, 0.436973, 0.287623, 0.138776, 0.155897],
+        "sesgo": 1.480688,
+    },
 }
 # === FIN PARAMETROS ===
 
@@ -683,12 +754,16 @@ PARAMS = {
 class Guardian:
     def score(self, caso):
         try:
-            x = caracteristicas(caso)
-            z = PARAMS["sesgo"]
-            for v, m, d, w in zip(x, PARAMS["media"], PARAMS["desv"], PARAMS["coef"]):
-                z += w * (v - m) / d
-            p = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
-            return min(1.0, max(0.0, p))
+            d = caracteristicas(caso)
+            modelo = elegir_modelo(d)
+            if modelo is None:
+                return SIN_SENALES
+            p = PARAMS[modelo]
+            z = p["sesgo"]
+            for v, m, s, w in zip(vector(d, modelo), p["media"], p["desv"], p["coef"]):
+                z += w * (v - m) / s
+            prob = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
+            return min(1.0, max(0.0, prob))
         except Exception:
             # Ante cualquier fallo, mejor una falsa alarma (cuesta 1) que un escape (cuesta 4)
             return 0.6
