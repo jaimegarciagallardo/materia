@@ -4,14 +4,18 @@
     python herramientas/montar_bot.py
 
 Qué hace:
-  1. Calcula las características (señales de D + reglas de P) de los casos H.
-  2. Validación cruzada AGRUPADA por tema (H201::r1..r9 siempre juntos), 5 bloques
-     × 3 semillas: cada caso se puntúa con un modelo que no lo ha visto.
-  3. Elige el corte con esas puntuaciones fuera de muestra (no con las de
-     entrenamiento, que saldrían infladas).
-  4. Entrena el modelo final con todo H y desplaza el sesgo para que ese corte
-     caiga en 0,5 (el organizador corta en 0,5).
-  5. Escribe mi_bot.py = reglas.py + plantilla_bot.py + pesos, y comprueba que
+  1. Calcula las características (señales de D + reglas de P) de los casos del train.
+  2. Entrena con H (peso x3: es lo que más se parece al test) y con las demás
+     familias (G, R, N, T, s), que aportan formatos distintos (respuestas largas,
+     contratos...) y ayudan a generalizar al giro. La familia «e» (1 fuente de una
+     línea) se deja fuera: no se parece ni al test ni al giro.
+  3. Validación cruzada AGRUPADA por tema en H (H201::r1..r9 siempre juntos), 5
+     bloques × 3 semillas, con las demás familias siempre en el entrenamiento: cada
+     caso H se puntúa con un modelo que no lo ha visto. Con eso se elige el corte.
+  4. Simulación del giro: se entrena SIN una familia (G o R) y se mide en ella,
+     con el corte elegido en H. Es lo más parecido a recibir un formato nuevo.
+  5. Entrena el modelo final y desplaza el sesgo para que el corte caiga en 0,5.
+  6. Escribe mi_bot.py = reglas.py + plantilla_bot.py + pesos, y comprueba que
      el fichero escrito da exactamente las mismas puntuaciones.
 """
 import importlib.util
@@ -29,6 +33,8 @@ sys.path.insert(0, GUARDIAN)
 import plantilla_bot as P  # noqa: E402
 
 PESO_ESCAPE = 4.0   # un escape pesa 4 veces más que una falsa alarma
+PESO_H = 3.0        # los casos H se parecen al test: pesan más
+FAMILIAS = ["H", "G", "R", "N", "T", "s"]
 L2 = 1.0
 
 
@@ -48,11 +54,11 @@ def auroc(y, s):
     return ((pos[:, None] > neg[None]).sum() + 0.5 * (pos[:, None] == neg[None]).sum()) / len(pos) / len(neg)
 
 
-def entrenar(X, y):
+def entrenar(X, y, pesos=None):
     media, desv = X.mean(0), X.std(0)
     desv[desv < 1e-9] = 1.0
     Z = np.c_[(X - media) / desv, np.ones(len(X))]
-    w = np.where(y == 1, PESO_ESCAPE, 1.0)
+    w = np.where(y == 1, PESO_ESCAPE, 1.0) * (1.0 if pesos is None else pesos)
     b = np.zeros(Z.shape[1])
     for _ in range(3000):
         p = 1 / (1 + np.exp(-Z @ b))
@@ -66,51 +72,62 @@ def predecir(m, X):
     return 1 / (1 + np.exp(-np.clip(z, -30, 30)))
 
 
-def validar(X, y, g, nombre):
-    """Validación cruzada agrupada por tema; devuelve el corte elegido fuera de muestra."""
+def familia(c):
+    return c["id"][0]
+
+
+def validar(datos, nombre):
+    """CV agrupada en H (las demás familias siempre entrenan) + simulación del giro.
+    Devuelve el corte elegido fuera de muestra en H."""
+    X = np.array([P.vector(d, nombre) for _, d in datos], float)
+    y = np.array([c["etiqueta"] for c, _ in datos], float)
+    fam = np.array([familia(c) for c, _ in datos])
+    tema = np.array([c["id"].split("::")[0] for c, _ in datos])
+    pesos = np.where(fam == "H", PESO_H, 1.0)
+    esH = fam == "H"
     oof = []
     for semilla in (0, 1, 2):
-        temas = np.unique(g)
+        temas = np.unique(tema[esH])
         np.random.default_rng(semilla).shuffle(temas)
-        Pr = np.zeros(len(y))
+        Pr = np.zeros(esH.sum())
         for bloque in np.array_split(temas, 5):
-            te = np.isin(g, bloque)
-            Pr[te] = predecir(entrenar(X[~te], y[~te]), X[te])
+            fuera = np.isin(tema, bloque) & esH
+            m = entrenar(X[~fuera], y[~fuera], pesos[~fuera])
+            Pr[np.isin(tema[esH], bloque)] = predecir(m, X[fuera])
         oof.append(Pr)
+    yH = y[esH]
     cortes = np.round(np.arange(0.05, 0.951, 0.01), 2)
-    medias = [np.mean([puntuacion(y, Pr, t)[0] for Pr in oof]) for t in cortes]
+    medias = [np.mean([puntuacion(yH, Pr, t)[0] for Pr in oof]) for t in cortes]
     corte = float(cortes[int(np.argmax(medias))])
-    fn = np.mean([puntuacion(y, Pr, corte)[1] for Pr in oof])
-    fp = np.mean([puntuacion(y, Pr, corte)[2] for Pr in oof])
-    print(f"  {nombre:12s} AUROC {np.mean([auroc(y, Pr) for Pr in oof]):.3f} · corte {corte:.2f} -> "
-          f"puntuación {max(medias):+.3f} (escapes {fn:.0f}, falsas alarmas {fp:.0f}) · con corte 0,5 sin mover: "
-          f"{np.mean([puntuacion(y, Pr, 0.5)[0] for Pr in oof]):+.3f}")
+    fn = np.mean([puntuacion(yH, Pr, corte)[1] for Pr in oof])
+    fp = np.mean([puntuacion(yH, Pr, corte)[2] for Pr in oof])
+    giro = []
+    for nueva in ("G", "R"):
+        dentro = fam != nueva
+        m = entrenar(X[dentro], y[dentro], pesos[dentro])
+        s, efn, efp = puntuacion(y[~dentro], predecir(m, X[~dentro]), corte)
+        giro.append(f"{nueva} {s:+.2f} (esc {efn}, FA {efp})")
+    print(f"  {nombre:9s} H: AUROC {np.mean([auroc(yH, Pr) for Pr in oof]):.3f} · corte {corte:.2f} -> "
+          f"{max(medias):+.3f} (escapes {fn:.0f}, falsas alarmas {fp:.0f})  |  familia nueva: {'  '.join(giro)}")
     return corte
 
 
 def main():
     train = cargar("train.jsonl")
-    H = [c for c in train if c["id"].startswith("H")]
-    noH = [c for c in train if not c["id"].startswith("H")]
-    dH = [P.caracteristicas(c) for c in H]
-    dN = [P.caracteristicas(c) for c in noH]
-    y = np.array([c["etiqueta"] for c in H], float)
-    yN = np.array([c["etiqueta"] for c in noH], float)
-    g = np.array([c["id"].split("::")[0] for c in H])
-    print(f"Validación cruzada agrupada en H ({len(H)} casos, {len(np.unique(g))} temas), 5 bloques × 3 semillas:")
+    datos = [(c, P.caracteristicas(c)) for c in train if familia(c) in FAMILIAS]
+    H = [c for c, _ in datos if familia(c) == "H"]
+    print(f"Entrenamiento: {len(datos)} casos ({', '.join(f'{f} {sum(familia(c) == f for c, _ in datos)}' for f in FAMILIAS)}),"
+          f" H pesa x{PESO_H:g}.")
+    print("Validación: CV agrupada en H (5 bloques × 3 semillas) y «familia nueva» (entrenar sin G o sin R y medir en ella):")
     modelos = {}
+    pesos = np.array([PESO_H if familia(c) == "H" else 1.0 for c, _ in datos])
+    y = np.array([c["etiqueta"] for c, _ in datos], float)
     for nombre in P.MODELOS:
-        X = np.array([P.vector(d, nombre) for d in dH], float)
-        corte = validar(X, y, g, nombre)
-        m = entrenar(X, y)
+        corte = validar(datos, nombre)
+        m = entrenar(np.array([P.vector(d, nombre) for _, d in datos], float), y, pesos)
         m["sesgo"] -= math.log(corte / (1 - corte))  # el corte elegido pasa a ser 0,5
         m["corte"] = corte
         modelos[nombre] = m
-    print("\nControl en no-H (otro formato, no usado para entrenar), corte 0,5:")
-    for nombre, m in modelos.items():
-        pN = predecir(m, np.array([P.vector(d, nombre) for d in dN], float))
-        s, fn, fp = puntuacion(yN, pN, 0.5)
-        print(f"  {nombre:12s} puntuación {s:+.3f} · AUROC {auroc(yN, pN):.3f} · {fn} escapes · {fp} falsas alarmas")
     print("\nPesos del modelo completo (estandarizados; positivo = empuja a «alucina»):")
     for k, w in sorted(zip(P.MODELOS["completo"], modelos["completo"]["coef"]), key=lambda kv: -abs(kv[1])):
         print(f"  {k:24s} {w:+.2f}")
@@ -137,7 +154,7 @@ def escribir_bot(modelos):
     cabecera = ('"""El Guardián: bot del equipo Syntax Terror (P13, P, D, J). FICHERO GENERADO, no editar a mano.\n\n'
                 "Se genera con `python herramientas/montar_bot.py` (desde kit/) a partir de\n"
                 "guardian/reglas.py (P), las señales de D (guardian/plantilla_bot.py) y los pesos\n"
-                "aprendidos en los casos H. Solo usa la librería estándar.\n\n"
+                "aprendidos en el train (casos H x3 + otras familias). Solo usa la librería estándar.\n\n"
                 "Cómo decide: señales del juez LLM y del NLI (peor oración) + reglas de verificación\n"
                 "(cifras, matices, alcance, causas; y cuentas que cuadran como pista a favor)\n"
                 "-> regresión logística ponderada 4:1 -> score. Dos modelos según lo que traiga el caso\n"

@@ -250,10 +250,9 @@ def comprobar_cifras(oracion, fuentes, fuentes_relevantes=None):
     anios = {c["valor"] for c in cifras_f if c["tipo"] == "anio"}
     fechas = {(c["valor"], c["mes"]) for c in cifras_f if c["tipo"] == "fecha"}
     res = {"cifra_nueva": 0.0, "cifra_no_derivable": 0.0, "cifra_dudosa": 0.0, "fecha_nueva": 0.0, "ratio_falso": 0.0,
-           "cifra_de_otra_fuente": 0.0, "cuenta_verificada": 0.0}
+           "cifra_de_otra_fuente": 0.0}
     tomadas = [x for x in cifras_or if x["tipo"] in ("num", "hora") and _cerca(x["valor"], literales, _tolerancia(x))]
     derivados = None
-    calculadas = 0
     for c in cifras_or:
         if c["tipo"] == "anio":
             if c["valor"] not in anios:
@@ -304,13 +303,41 @@ def comprobar_cifras(oracion, fuentes, fuentes_relevantes=None):
         elif c.get("pct") and len(tomadas) >= 2 and not _derivable(c, tol, (1,), _derivados([t["valor"] for t in tomadas], None)):
             # «812 de 1.326, más del 70 %»: el porcentaje debe salir de las cifras de la frase
             res["cifra_no_derivable"] = 1.0
-        else:
-            calculadas += 1
-    # Pista POSITIVA: la oración hace cuentas y todas cuadran con las fuentes. El NLI
-    # no sabe hacer cuentas («suman 8 de los 15») y da poco respaldo a estas frases fieles.
-    if calculadas and not (res["cifra_no_derivable"] or res["cifra_dudosa"] or res["ratio_falso"]):
-        res["cuenta_verificada"] = 1.0
     return res
+
+
+def cuenta_verificada(oracion, fuentes, clausulas):
+    """Pista A FAVOR: la oración hace cuentas («suman 8 de los 15») y TODAS salen de
+    una operación entre dos cifras de las cláusulas relevantes (o de las que la propia
+    oración toma de las fuentes). El NLI no sabe hacer cuentas y da poco respaldo a
+    estas frases aunque sean fieles.
+
+    Es deliberadamente estricta (pares, sin tríos, solo cláusulas relevantes): con
+    todas las cifras de varias fuentes, una cifra FALSA «cuadraba» por azar el ~27 %
+    de las veces; así, el ~15 %.
+    """
+    cifras_or = extraer_cifras(oracion)
+    literales = sorted(c["valor"] for f in fuentes for c in extraer_cifras(f))
+    tomadas = [x["valor"] for x in cifras_or if x["tipo"] in ("num", "hora") and _cerca(x["valor"], literales, _tolerancia(x))]
+    calculadas = [x for x in cifras_or if x["tipo"] == "num" and not _cerca(x["valor"], literales, _tolerancia(x))
+                  and not (x["texto"] in PALABRAS_NUM and x["valor"] <= 3)]
+    if not calculadas:
+        return 0.0
+    pool = [x["valor"] for c in clausulas for x in extraer_cifras(c) if x["tipo"] in ("num", "hora")] + tomadas
+    if len(set(pool)) > 25:  # demasiadas cifras: cualquier número cuadraría, no se verifica
+        return 0.0
+    derivados = _solo_pares(pool)
+    return float(all(_derivable(x, _tolerancia(x), (1,), derivados) for x in calculadas))
+
+
+def _solo_pares(pool):
+    vals = sorted(set(v for v in pool if v) | {100.0})
+    out = set(vals)
+    out.update(100 - v for v in vals if 0 < v < 100)
+    for i, a in enumerate(vals):
+        for b in vals[i + 1:]:
+            out.update(_ops(a, b))
+    return sorted(out)
 
 
 def _derivable(c, tol, escalas, derivados):
@@ -570,6 +597,7 @@ def caracteristicas_reglas(oracion, fuentes_relevantes, fuentes, pregunta=""):
         return res
     relevantes = clausulas_relevantes(oracion, fuentes_relevantes)
     res.update(comprobar_cifras(oracion, fuentes, fuentes_relevantes))
+    res["cuenta_verificada"] = cuenta_verificada(oracion, fuentes, relevantes)
     res.update(matices_perdidos(oracion, relevantes))
     res["aproximacion_perdida"] = aproximacion_perdida(oracion, relevantes)
     res.update(alcance(oracion, relevantes))
@@ -602,17 +630,39 @@ def _oraciones(caso):
     return [{"texto": p} for p in partes if p.strip()]
 
 
+def _respaldo(o):
+    vals = [v for v in (o.get("respaldo_por_fuente") or []) if isinstance(v, (int, float))]
+    return max(vals) if vals else None
+
+
 def reglas_caso(caso, estricto=False):
     """Pistas del caso completo: el máximo de cada pista sobre todas las oraciones
-    (una sola afirmación falsa basta, así que no se promedia)."""
+    (una sola afirmación falsa basta, así que no se promedia).
+
+    Excepción: cuenta_verificada es una pista A FAVOR y solo cuenta en la oración
+    más sospechosa (la de menos respaldo del NLI): que una frase haga bien sus cuentas
+    no debe tranquilizar sobre otra frase distinta. Sin datos del NLI, tienen que
+    cuadrar las cuentas de todas las oraciones que las hagan.
+    """
     fuentes = caso.get("fuentes") or []
     total = dict.fromkeys(NOMBRES, 0.0)
     try:
-        for o in _oraciones(caso):
+        oraciones = _oraciones(caso)
+        por_oracion = []
+        for o in oraciones:
             r = caracteristicas_reglas(o.get("texto", ""), _fuentes_relevantes(o, fuentes),
                                        fuentes, caso.get("pregunta", ""))
+            por_oracion.append(r)
             for k, v in r.items():
                 total[k] = max(total[k], v)
+        respaldos = [_respaldo(o) for o in oraciones]
+        if por_oracion and all(r is not None for r in respaldos):
+            peor = min(range(len(oraciones)), key=lambda i: respaldos[i])
+            total["cuenta_verificada"] = por_oracion[peor]["cuenta_verificada"]
+        elif por_oracion:
+            con_cuentas = [r["cuenta_verificada"] for r, o in zip(por_oracion, oraciones)
+                           if any(x["tipo"] == "num" for x in extraer_cifras(o.get("texto", "")))]
+            total["cuenta_verificada"] = min(con_cuentas) if con_cuentas else 0.0
     except Exception:
         if estricto:  # al medir queremos ver el fallo
             raise

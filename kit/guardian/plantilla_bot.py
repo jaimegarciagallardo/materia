@@ -9,10 +9,11 @@ Cómo decide el bot:
   1. Señales (D): veredicto y confianza del juez LLM y respaldo del NLI,
      quedándose siempre con la PEOR oración.
   2. Reglas (P): cifras que no cuadran, matices perdidos, alcance, causas
-     añadidas y, como pista a favor, cuentas que sí cuadran.
-  3. Regresión logística (pesos aprendidos en los casos H, con un escape pesando
-     4 veces más que una falsa alarma) y un sesgo desplazado para que el corte
-     óptimo, elegido fuera de muestra, caiga exactamente en 0,5.
+     añadidas y, como pista a favor, cuentas que sí cuadran (verificación estricta).
+  3. Regresión logística (pesos aprendidos en los casos H, que pesan x3, y en las
+     demás familias del train; un escape pesa 4 veces más que una falsa alarma) y un
+     sesgo desplazado para que el corte óptimo, elegido fuera de muestra en H, caiga
+     exactamente en 0,5.
 
 Hay dos modelos según lo que traiga cada caso (pensado para el giro, por si
 cambia el formato): completo y sin juez LLM. Sin LLM ni NLI, se marca como sospechoso.
@@ -23,13 +24,19 @@ import unicodedata
 from reglas import RECOMENDADAS, reglas_caso  # en mi_bot.py esta línea se sustituye por reglas.py entero
 
 SENALES_LLM = ["llm_no_respaldada", "llm_contradicha", "llm_confianza_duda"]
-SENALES_NLI = ["nli_min_respaldo", "frag_min_respaldo"]
-# Fuera: nli_max_contradiccion y nli_respaldo_todas_min. En H no distinguen (AUROC ~0,5)
-# y el modelo les daba pesos con el signo al revés: era ruido.
+SENALES_NLI = ["frag_min_respaldo", "frac_resp"]
+# Fuera: nli_max_contradiccion y nli_respaldo_todas_min (en H no distinguen, AUROC ~0,5) y
+# nli_min_respaldo (junto a frac_resp salía con el signo al revés). Pesos al revés = ruido.
+# frac_resp = fracción de oraciones con respaldo NLI >= 0,5: en respuestas largas siempre
+# hay alguna frase floja para el NLI; «la peor frase» sola acusaba a muchas fieles.
+
+# Reglas de P que entran al modelo: las RECOMENDADAS menos tres que casi no pesaban
+# (aproximacion_perdida, ratio_falso, cifra_dudosa) y salían con pesos nulos o al revés.
+REGLAS_MODELO = [k for k in RECOMENDADAS if k not in ("aproximacion_perdida", "ratio_falso", "cifra_dudosa")]
 
 MODELOS = {
-    "completo": SENALES_LLM + SENALES_NLI + RECOMENDADAS,
-    "sin_llm": SENALES_NLI + RECOMENDADAS,
+    "completo": SENALES_LLM + SENALES_NLI + REGLAS_MODELO,
+    "sin_llm": SENALES_NLI + REGLAS_MODELO,
 }
 # Sin LLM ni NLI no hay modelo: uno «solo reglas» daba −0,05 fuera de H (peor que
 # marcarlo todo), así que en ese caso se marca como sospechoso (puntuación 0 asegurada).
@@ -77,6 +84,7 @@ def caracteristicas_senales(caso):
     no_resp = contra = duda = 0.0
     hay_llm = False
     min_resp = None
+    respaldos = []
     for o in oraciones:
         llm = o.get("llm") or {}
         ver = _veredicto(llm.get("veredicto"))
@@ -93,6 +101,7 @@ def caracteristicas_senales(caso):
         m = _max(o.get("respaldo_por_fuente"))
         if m is not None:
             min_resp = m if min_resp is None else min(min_resp, m)
+            respaldos.append(m)
     frag = None
     for f in fragmentos:
         m = _max(f.get("respaldo_por_fuente"))
@@ -102,10 +111,13 @@ def caracteristicas_senales(caso):
         min_resp = frag
     if frag is None:
         frag = min_resp
+    if not respaldos:  # sin oraciones: la fracción se calcula sobre los fragmentos
+        respaldos = [m for m in (_max(f.get("respaldo_por_fuente")) for f in fragmentos) if m is not None]
     hay_nli = min_resp is not None
+    frac = sum(r >= 0.5 for r in respaldos) / len(respaldos) if respaldos else 0.0
     return {"llm_no_respaldada": no_resp, "llm_contradicha": contra, "llm_confianza_duda": duda,
             "nli_min_respaldo": min_resp if hay_nli else 0.0, "frag_min_respaldo": frag if hay_nli else 0.0,
-            "hay_llm": hay_llm, "hay_nli": hay_nli}
+            "frac_resp": frac, "hay_llm": hay_llm, "hay_nli": hay_nli}
 
 
 def caracteristicas(caso):
