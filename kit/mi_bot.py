@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 """El Guardián: bot del equipo (P13, P, D, J). FICHERO GENERADO, no editar a mano.
 
 Se genera con `python herramientas/montar_bot.py` (desde kit/) a partir de
@@ -693,5 +692,3 @@ class Guardian:
         except Exception:
             # Ante cualquier fallo, mejor una falsa alarma (cuesta 1) que un escape (cuesta 4)
             return 0.6
-=======
->>>>>>> e54329e (.)
