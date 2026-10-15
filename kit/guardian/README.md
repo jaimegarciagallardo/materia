@@ -10,13 +10,15 @@ de D combina con las señales.
 | `evaluar_reglas.py` | Mide cada regla en H, H con LLM=«respaldada», no-H y test, y lo que aporta al modelo. |
 | `probar_reglas.py` | 20 pruebas con frases inventadas y casos raros (sin `llm`, sin fragmentos...). |
 
-Desde la raíz del repositorio (`material/`):
+Desde la carpeta `kit/`:
 
 ```
 python guardian/probar_reglas.py                                                 # ¿funciona todo?
 python guardian/evaluar_reglas.py                                                # informe completo
 python guardian/evaluar_reglas.py --ejemplos modal_perdido --etiqueta 0 --n 5    # ver falsas alarmas de una regla
 ```
+
+(Desde la raíz del repositorio, lo mismo con `kit/guardian/...`).
 
 ## Casos H y no-H
 
@@ -116,5 +118,5 @@ Contando todos los casos H (334 fieles y 297 alucinaciones), las reglas buenas s
 2. Verbos endurecidos sin marcador: «vacunó» → «inmunizó», «presupuesto» → «costará».
 3. Reutilizar `normalizar` y `cifras` de P13 cuando estén, para no duplicar código. Las de aquí sirven mientras tanto.
 
-> Nota: el reparto en `ORGANIZACION.md` decía `kit/guardian/reglas.py`; el módulo vive en `guardian/`, en la raíz del repositorio.
+> Nota: el módulo vive en `kit/guardian/`, junto a `senales.py` (D) y `texto.py` (P13), como dice `ORGANIZACION.md`.
 > El proceso completo, paso a paso, está en `PROCESO_P.md` (fuera del repositorio).

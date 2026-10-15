@@ -23,7 +23,7 @@ AQUI = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, AQUI)
 from reglas import NOMBRES, RECOMENDADAS, reglas_caso  # noqa: E402
 
-KIT = os.path.join(AQUI, "..", "kit")
+KIT = os.path.dirname(AQUI)  # kit/, donde están train.jsonl y test_publico.jsonl
 
 
 def cargar(nombre):
