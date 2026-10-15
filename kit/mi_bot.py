@@ -7,8 +7,9 @@ aprendidos en el train (casos H x3 + otras familias). Solo usa la librería est�
 Cómo decide: señales del juez LLM y del NLI (peor oración) + reglas de verificación
 (cifras, matices, alcance, causas; y cuentas que cuadran como pista a favor)
 -> regresión logística ponderada 4:1 -> score. Dos modelos según lo que traiga el caso
-(completo / sin juez LLM; sin señales, sospechoso). Cortes óptimos fuera de muestra desplazados
-a 0,5: completo 0.47, sin_llm 0.53.
+(completo / sin juez LLM; sin señales, sospechoso). En respuestas de varias frases
+se puntúa cada frase y se combinan con noisy-OR (probabilidad de que alguna mienta).
+Cortes óptimos fuera de muestra, recolocados en 0,5: completo 0.47 (una frase) y 0.80 (varias); sin_llm 0.53 (una frase) y 0.90 (varias).
 """
 
 # ===========================================================================
@@ -823,19 +824,79 @@ def vector(d, modelo):
     return [float(d[k]) for k in MODELOS[modelo]]
 
 
+def frases(caso):
+    """Un mini-caso por oración, con sus fragmentos (para respuestas de varias frases)."""
+    senales = caso.get("senales") or {}
+    oraciones = senales.get("oraciones") or []
+    fragmentos = senales.get("fragmentos") or []
+    out = []
+    for i, o in enumerate(oraciones):
+        propios = [dict(f, oracion=0) for f in fragmentos if f.get("oracion") == i]
+        out.append({"pregunta": caso.get("pregunta", ""), "fuentes": caso.get("fuentes") or [],
+                    "respuesta": o.get("texto", ""), "senales": {"oraciones": [o], "fragmentos": propios}})
+    return out
+
+
+def prob_cruda(d, modelo):
+    """Probabilidad del modelo antes de mover el corte."""
+    p = PARAMS[modelo]
+    z = p["sesgo"]
+    for v, m, s, w in zip(vector(d, modelo), p["media"], p["desv"], p["coef"]):
+        z += w * (v - m) / s
+    return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
+
+
+def _logit(p):
+    p = min(1 - 1e-12, max(1e-12, p))
+    return math.log(p / (1 - p))
+
+
+def recolocar(p, corte):
+    """Transformación monótona que lleva `corte` a 0,5 (el organizador corta en 0,5)."""
+    return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, _logit(p) - _logit(corte)))))
+
+
+def score_caso(caso):
+    """Respuesta de una frase: el modelo directamente.
+
+    Respuesta de varias frases (el giro): se puntúa CADA frase por separado y se
+    combinan con «noisy-OR», la probabilidad de que AL MENOS UNA mienta:
+    1 − Π(1 − p_i). Basta una frase falsa, pero con 3-4 frases casi siempre alguna
+    parece algo sospechosa, así que este caso tiene su propio corte, más exigente
+    (elegido fuera de muestra con respuestas largas simuladas a partir de H).
+    """
+    d = caracteristicas(caso)
+    modelo = elegir_modelo(d)
+    if modelo is None:
+        return SIN_SENALES
+    partes = frases(caso)
+    if len(partes) <= 1:
+        return recolocar(prob_cruda(d, modelo), PARAMS[modelo]["corte_unica"])
+    sigue_fiel = 1.0
+    for parte in partes:
+        dp = caracteristicas(parte)
+        mp = elegir_modelo(dp) or modelo
+        sigue_fiel *= 1.0 - prob_cruda(dp, mp)
+    return recolocar(1.0 - sigue_fiel, PARAMS[modelo]["corte_larga"])
+
+
 # === PARAMETROS (los escribe herramientas/montar_bot.py) ===
 PARAMS = {
-    'completo': {  # corte 0.47 desplazado a 0,5
+    'completo': {
         "media": [0.087797, 0.24, 0.025689, 0.387632, 0.317551, 0.050713, 0.130745, 0.558637, 0.041204, 0.041997, 0.038035, 0.024564, 0.032488, 0.034073, 0.043582, 0.010301],
         "desv": [0.263114, 0.415673, 0.036764, 0.385691, 0.448661, 0.219411, 0.337121, 0.49655, 0.198763, 0.200582, 0.19128, 0.154793, 0.177293, 0.181416, 0.204162, 0.10097],
         "coef": [1.072418, 2.182479, 0.68199, -0.469759, -0.213793, 0.696034, -1.0118, 0.199529, 0.335045, 0.391264, 0.3724, 0.137308, 0.390353, 0.308232, 0.158296, 0.182012],
-        "sesgo": 2.026925,
+        "sesgo": 1.90678,
+        "corte_unica": 0.47,  # respuestas de una frase
+        "corte_larga": 0.8,  # varias frases (noisy-OR)
     },
-    'sin_llm': {  # corte 0.53 desplazado a 0,5
+    'sin_llm': {
         "media": [0.387632, 0.317551, 0.050713, 0.130745, 0.558637, 0.041204, 0.041997, 0.038035, 0.024564, 0.032488, 0.034073, 0.043582, 0.010301],
         "desv": [0.385691, 0.448661, 0.219411, 0.337121, 0.49655, 0.198763, 0.200582, 0.19128, 0.154793, 0.177293, 0.181416, 0.204162, 0.10097],
         "coef": [-0.604026, -0.37601, 0.563542, -0.940898, 0.109776, 0.239843, 0.283362, 0.280285, 0.175047, 0.320244, 0.228763, 0.147474, 0.155071],
-        "sesgo": 1.262642,
+        "sesgo": 1.382786,
+        "corte_unica": 0.53,  # respuestas de una frase
+        "corte_larga": 0.9,  # varias frases (noisy-OR)
     },
 }
 # === FIN PARAMETROS ===
@@ -844,16 +905,7 @@ PARAMS = {
 class Guardian:
     def score(self, caso):
         try:
-            d = caracteristicas(caso)
-            modelo = elegir_modelo(d)
-            if modelo is None:
-                return SIN_SENALES
-            p = PARAMS[modelo]
-            z = p["sesgo"]
-            for v, m, s, w in zip(vector(d, modelo), p["media"], p["desv"], p["coef"]):
-                z += w * (v - m) / s
-            prob = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
-            return min(1.0, max(0.0, prob))
+            return min(1.0, max(0.0, score_caso(caso)))
         except Exception:
             # Ante cualquier fallo, mejor una falsa alarma (cuesta 1) que un escape (cuesta 4)
             return 0.6

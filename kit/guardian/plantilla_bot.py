@@ -17,6 +17,7 @@ Cómo decide el bot:
 
 Hay dos modelos según lo que traiga cada caso (pensado para el giro, por si
 cambia el formato): completo y sin juez LLM. Sin LLM ni NLI, se marca como sospechoso.
+En respuestas de varias frases se puntúa cada frase y se combinan (ver score_caso).
 """
 import math
 import unicodedata
@@ -137,6 +138,62 @@ def vector(d, modelo):
     return [float(d[k]) for k in MODELOS[modelo]]
 
 
+def frases(caso):
+    """Un mini-caso por oración, con sus fragmentos (para respuestas de varias frases)."""
+    senales = caso.get("senales") or {}
+    oraciones = senales.get("oraciones") or []
+    fragmentos = senales.get("fragmentos") or []
+    out = []
+    for i, o in enumerate(oraciones):
+        propios = [dict(f, oracion=0) for f in fragmentos if f.get("oracion") == i]
+        out.append({"pregunta": caso.get("pregunta", ""), "fuentes": caso.get("fuentes") or [],
+                    "respuesta": o.get("texto", ""), "senales": {"oraciones": [o], "fragmentos": propios}})
+    return out
+
+
+def prob_cruda(d, modelo):
+    """Probabilidad del modelo antes de mover el corte."""
+    p = PARAMS[modelo]
+    z = p["sesgo"]
+    for v, m, s, w in zip(vector(d, modelo), p["media"], p["desv"], p["coef"]):
+        z += w * (v - m) / s
+    return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
+
+
+def _logit(p):
+    p = min(1 - 1e-12, max(1e-12, p))
+    return math.log(p / (1 - p))
+
+
+def recolocar(p, corte):
+    """Transformación monótona que lleva `corte` a 0,5 (el organizador corta en 0,5)."""
+    return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, _logit(p) - _logit(corte)))))
+
+
+def score_caso(caso):
+    """Respuesta de una frase: el modelo directamente.
+
+    Respuesta de varias frases (el giro): se puntúa CADA frase por separado y se
+    combinan con «noisy-OR», la probabilidad de que AL MENOS UNA mienta:
+    1 − Π(1 − p_i). Basta una frase falsa, pero con 3-4 frases casi siempre alguna
+    parece algo sospechosa, así que este caso tiene su propio corte, más exigente
+    (elegido fuera de muestra con respuestas largas simuladas a partir de H).
+    """
+    d = caracteristicas(caso)
+    modelo = elegir_modelo(d)
+    if modelo is None:
+        return SIN_SENALES
+    partes = frases(caso)
+    if len(partes) <= 1:
+        return recolocar(prob_cruda(d, modelo), PARAMS[modelo]["corte_unica"])
+    sigue_fiel = 1.0
+    for parte in partes:
+        dp = caracteristicas(parte)
+        mp = elegir_modelo(dp) or modelo
+        sigue_fiel *= 1.0 - prob_cruda(dp, mp)
+    return recolocar(1.0 - sigue_fiel, PARAMS[modelo]["corte_larga"])
+
+
 # === PARAMETROS (los escribe herramientas/montar_bot.py) ===
 PARAMS = None
 # === FIN PARAMETROS ===
@@ -145,16 +202,7 @@ PARAMS = None
 class Guardian:
     def score(self, caso):
         try:
-            d = caracteristicas(caso)
-            modelo = elegir_modelo(d)
-            if modelo is None:
-                return SIN_SENALES
-            p = PARAMS[modelo]
-            z = p["sesgo"]
-            for v, m, s, w in zip(vector(d, modelo), p["media"], p["desv"], p["coef"]):
-                z += w * (v - m) / s
-            prob = 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, z))))
-            return min(1.0, max(0.0, prob))
+            return min(1.0, max(0.0, score_caso(caso)))
         except Exception:
             # Ante cualquier fallo, mejor una falsa alarma (cuesta 1) que un escape (cuesta 4)
             return 0.6
