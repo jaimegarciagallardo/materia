@@ -9,7 +9,7 @@ Cómo decide: señales del juez LLM y del NLI (peor oración) + reglas de verifi
 -> regresión logística ponderada 4:1 -> score. Dos modelos según lo que traiga el caso
 (completo / sin juez LLM; sin señales, sospechoso). En respuestas de varias frases
 se puntúa cada frase y se combinan con noisy-OR (probabilidad de que alguna mienta).
-Cortes óptimos fuera de muestra, recolocados en 0,5: completo 0.47 (una frase) y 0.80 (varias); sin_llm 0.53 (una frase) y 0.90 (varias).
+Cortes óptimos fuera de muestra, recolocados en 0,5: completo 0.47 (una frase) y 0.92 (varias); sin_llm 0.53 (una frase) y 0.84 (varias).
 """
 
 # ===========================================================================
@@ -888,7 +888,7 @@ PARAMS = {
         "coef": [1.072418, 2.182479, 0.68199, -0.469759, -0.213793, 0.696034, -1.0118, 0.199529, 0.335045, 0.391264, 0.3724, 0.137308, 0.390353, 0.308232, 0.158296, 0.182012],
         "sesgo": 1.90678,
         "corte_unica": 0.47,  # respuestas de una frase
-        "corte_larga": 0.8,  # varias frases (noisy-OR)
+        "corte_larga": 0.92,  # varias frases (noisy-OR)
     },
     'sin_llm': {
         "media": [0.387632, 0.317551, 0.050713, 0.130745, 0.558637, 0.041204, 0.041997, 0.038035, 0.024564, 0.032488, 0.034073, 0.043582, 0.010301],
@@ -896,7 +896,7 @@ PARAMS = {
         "coef": [-0.604026, -0.37601, 0.563542, -0.940898, 0.109776, 0.239843, 0.283362, 0.280285, 0.175047, 0.320244, 0.228763, 0.147474, 0.155071],
         "sesgo": 1.382786,
         "corte_unica": 0.53,  # respuestas de una frase
-        "corte_larga": 0.9,  # varias frases (noisy-OR)
+        "corte_larga": 0.84,  # varias frases (noisy-OR)
     },
 }
 # === FIN PARAMETROS ===

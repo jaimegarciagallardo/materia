@@ -41,6 +41,12 @@ import plantilla_bot as P  # noqa: E402
 
 PESO_ESCAPE = 4.0   # un escape pesa 4 veces más que una falsa alarma
 PESO_H = 3.0        # los casos H se parecen al test: pesan más
+# Proporción de respuestas largas que mienten. En el giro se estima en ~22 % (el juez
+# dice «NO» en el 17 % de los casos; en largas simuladas lo dice en el 45 % de las que
+# mienten y en el 9 % de las fieles). El corte de respuestas largas se elige por la nota
+# MEDIA dentro de este rango, no solo en la estimación (el criterio del peor caso
+# resultó inestable: según qué respuestas se simulaban, saltaba entre 0,80 y 0,92).
+PREVALENCIAS_LARGAS = (0.15, 0.22, 0.30, 0.40)
 FAMILIAS = ["H", "G", "R", "N", "T", "s"]
 L2 = 1.0
 
@@ -116,13 +122,31 @@ def respuestas_largas(train, por_tema=6, semilla=0):
     return casos
 
 
+def puntuacion_prevalencia(y, p, t, pi):
+    """Puntuación como si la proporción de mentiras fuera pi (repondera los casos)."""
+    wp, wn = pi / np.mean(y == 1), (1 - pi) / np.mean(y == 0)
+    fn, fp = wp * np.sum((y == 1) & (p < t)), wn * np.sum((y == 0) & (p >= t))
+    return 1 - (4 * fn + fp) / (wn * np.sum(y == 0))
+
+
+def estimar_prevalencia(casos, largas_sim):
+    """Proporción de respuestas que mienten en `casos` (sin etiquetas), a partir de con
+    qué frecuencia dice «NO» el juez LLM, comparada con las respuestas largas simuladas."""
+    def dice_no(c):
+        return any((o.get("llm") or {}).get("veredicto") != "respaldada" for o in c["senales"]["oraciones"])
+    y = np.array([c["etiqueta"] for c in largas_sim])
+    n = np.array([dice_no(c) for c in largas_sim])
+    a, b = n[y == 1].mean(), n[y == 0].mean()
+    return (np.mean([dice_no(c) for c in casos]) - b) / (a - b)
+
+
 def probs_largas(m, nombre, frases_d):
     """noisy-OR: probabilidad de que al menos una frase mienta."""
     ps = predecir(m, np.array([P.vector(d, nombre) for d in frases_d], float))
     return 1 - np.prod(1 - ps)
 
 
-def validar_larga(datos, largas, nombre, corte_unica):
+def validar_larga(datos, largas, nombre, corte_unica, prevalencias=PREVALENCIAS_LARGAS):
     """Elige el corte de las respuestas largas fuera de muestra (agrupando por tema)."""
     X = np.array([P.vector(d, nombre) for _, d in datos], float)
     y = np.array([c["etiqueta"] for c, _ in datos], float)
@@ -143,8 +167,13 @@ def validar_larga(datos, largas, nombre, corte_unica):
                 Pr[i] = probs_largas(m, nombre, largas[i][1])
         oof.append(Pr)
     cortes = np.round(np.arange(0.30, 0.961, 0.01), 2)
-    medias = [np.mean([puntuacion(yL, Pr, t)[0] for Pr in oof]) for t in cortes]
-    corte = float(cortes[int(np.argmax(medias))])
+    # el corte con mejor nota media en el rango plausible de proporción de mentiras
+    media_rango = [np.mean([puntuacion_prevalencia(yL, Pr, t, pi) for Pr in oof for pi in prevalencias])
+                   for t in cortes]
+    corte = float(cortes[int(np.argmax(media_rango))])
+    por_pi = "  ".join(f"{pi:.0%}: {np.mean([puntuacion_prevalencia(yL, Pr, corte, pi) for Pr in oof]):+.3f}"
+                       for pi in PREVALENCIAS_LARGAS + (0.5,))
+    medias = [np.mean([puntuacion(yL, Pr, corte)[0] for Pr in oof])]
     fn = np.mean([puntuacion(yL, Pr, corte)[1] for Pr in oof])
     fp = np.mean([puntuacion(yL, Pr, corte)[2] for Pr in oof])
     sin = np.mean([puntuacion(yL, Pr, corte_unica)[0] for Pr in oof])
@@ -163,8 +192,11 @@ def validar_larga(datos, largas, nombre, corte_unica):
         yy, p, t = np.array([c["etiqueta"] for c, _ in cs], float), np.array(p), np.array(t)
         efn, efp = int(((yy == 1) & (p < t)).sum()), int(((yy == 0) & (p >= t)).sum())
         giro.append(f"{nueva} {1 - (4 * efn + efp) / (yy == 0).sum():+.2f} (esc {efn}, FA {efp})")
-    print(f"  {nombre:9s} largas simuladas ({len(yL)}): corte {corte:.2f} -> {max(medias):+.3f} (escapes {fn:.0f}, "
-          f"falsas alarmas {fp:.0f}; con el corte de frase única {sin:+.3f})  |  familia nueva: {'  '.join(giro)}")
+    print(f"  {nombre:9s} largas simuladas ({len(yL)}): corte {corte:.2f} (mejor nota media entre "
+          f"{prevalencias[0]:.0%} y {prevalencias[-1]:.0%} de mentiras)\n"
+          f"            nota según la proporción real de mentiras -> {por_pi}\n"
+          f"            con 50 % de mentiras: escapes {fn:.0f}, falsas alarmas {fp:.0f} (con el corte de frase única: {sin:+.3f})"
+          f"  |  familia nueva: {'  '.join(giro)}")
     return corte
 
 
@@ -217,10 +249,16 @@ def main():
     cortes = {}
     for nombre in P.MODELOS:
         cortes[nombre] = validar(datos, nombre)
-    largas = [(c, [P.caracteristicas(x) for x in P.frases(c)]) for c in respuestas_largas(train)]
+    largas = [(c, [P.caracteristicas(x) for x in P.frases(c)])
+              for semilla in (0, 1) for c in respuestas_largas(train, por_tema=12, semilla=semilla)]
     print(f"Respuestas largas (como el giro), simuladas con frases H del mismo tema; puntuación por frase + noisy-OR:")
+    if os.path.exists(os.path.join(KIT, "giro_publico.jsonl")):
+        pi = estimar_prevalencia(cargar("giro_publico.jsonl"), [c for c, _ in largas])
+        print(f"  (proporción de mentiras estimada en el giro, sin etiquetas: {pi:.0%})")
     for nombre in P.MODELOS:
-        corte_larga = validar_larga(datos, largas, nombre, cortes[nombre])
+        # Sin juez LLM no se puede estimar la proporción de mentiras: se supone un 50 % (prudente).
+        prev = PREVALENCIAS_LARGAS if nombre == "completo" else (0.5,)
+        corte_larga = validar_larga(datos, largas, nombre, cortes[nombre], prev)
         m = entrenar(np.array([P.vector(d, nombre) for _, d in datos], float), y, pesos)
         m["corte_unica"], m["corte_larga"] = cortes[nombre], corte_larga
         modelos[nombre] = m
