@@ -8,7 +8,7 @@ Cómo decide: señales del juez LLM y del NLI (peor oración) + reglas de verifi
 (cifras, matices, alcance, causas; y cuentas que cuadran como pista a favor)
 -> regresión logística ponderada 4:1 -> score. Dos modelos según lo que traiga el caso
 (completo / sin juez LLM; sin señales, sospechoso). Cortes óptimos fuera de muestra desplazados
-a 0,5: completo 0.42, sin_llm 0.55.
+a 0,5: completo 0.47, sin_llm 0.53.
 """
 
 # ===========================================================================
@@ -333,6 +333,29 @@ def cuenta_verificada(oracion, fuentes, clausulas):
     return float(all(_derivable(x, _tolerancia(x), (1,), derivados) for x in calculadas))
 
 
+def cifras_comprobadas(oracion, clausulas):
+    """Pista A FAVOR: la oración tiene cifras y TODAS están en sus cláusulas relevantes
+    o salen de una operación entre dos cifras de esas cláusulas.
+
+    El NLI se lía con frases llenas de cifras aunque estén bien copiadas («18.500 €,
+    21.000 €, 39.500 €» frente a «Total: 39.500 €»): en los contratos largos (familia
+    G, la más parecida al giro) era la causa de 20 de 25 falsas alarmas. A diferencia
+    de cuenta_verificada, no exige que haya una cifra calculada.
+    """
+    cifras = [x for x in extraer_cifras(oracion) if x["tipo"] in ("num", "hora")
+              and not (x["texto"] in PALABRAS_NUM and x["valor"] <= 3)]
+    if not cifras:
+        return 0.0
+    en_clausulas = [x for c in clausulas for x in extraer_cifras(c)]
+    literales = sorted(x["valor"] for x in en_clausulas)
+    pool = [x["valor"] for x in en_clausulas if x["tipo"] in ("num", "hora")]
+    if len(set(pool)) > 25:  # demasiadas cifras: cualquier número cuadraría, no se comprueba
+        return 0.0
+    derivados = _solo_pares(pool)
+    return float(all(_cerca(x["valor"], literales, _tolerancia(x)) or _derivable(x, _tolerancia(x), (1,), derivados)
+                     for x in cifras))
+
+
 def _solo_pares(pool):
     vals = sorted(set(v for v in pool if v) | {100.0})
     out = set(vals)
@@ -565,7 +588,7 @@ def contenido_nuevo(oracion, fuentes, pregunta=""):
 # ---------------------------------------------------------------------------
 
 NOMBRES = ["cifra_nueva", "cifra_no_derivable", "cifra_dudosa", "fecha_nueva", "ratio_falso", "cifra_de_otra_fuente",
-           "cuenta_verificada",
+           "cuenta_verificada", "cifras_comprobadas",
            "modal_perdido", "condicion_perdida", "restriccion_perdida", "intencion_como_hecho", "aproximacion_perdida",
            "parcial_perdido", "universal_anadido", "modificador_omitido",
            "causa_anadida", "consecuencia_anadida", "palabras_nuevas", "racha_nueva"]
@@ -577,7 +600,7 @@ NOMBRES = ["cifra_nueva", "cifra_no_derivable", "cifra_dudosa", "fecha_nueva", "
 # escribieron editando poco la fuente. Es un atajo del formato: entrenado en H y
 # probado en el resto del train hunde la puntuación (de +0,54 a +0,14 con el
 # corte en 0,5), así que en el giro haría daño. Se calculan, pero no se usan.
-RECOMENDADAS = ["cifra_no_derivable", "cifra_dudosa", "ratio_falso", "cuenta_verificada",
+RECOMENDADAS = ["cifra_no_derivable", "cifra_dudosa", "ratio_falso", "cuenta_verificada", "cifras_comprobadas",
                 "modal_perdido", "condicion_perdida", "restriccion_perdida", "intencion_como_hecho",
                 "aproximacion_perdida", "parcial_perdido", "modificador_omitido",
                 "causa_anadida", "consecuencia_anadida"]
@@ -601,6 +624,7 @@ def caracteristicas_reglas(oracion, fuentes_relevantes, fuentes, pregunta=""):
     relevantes = clausulas_relevantes(oracion, fuentes_relevantes)
     res.update(comprobar_cifras(oracion, fuentes, fuentes_relevantes))
     res["cuenta_verificada"] = cuenta_verificada(oracion, fuentes, relevantes)
+    res["cifras_comprobadas"] = cifras_comprobadas(oracion, relevantes)
     res.update(matices_perdidos(oracion, relevantes))
     res["aproximacion_perdida"] = aproximacion_perdida(oracion, relevantes)
     res.update(alcance(oracion, relevantes))
@@ -633,6 +657,9 @@ def _oraciones(caso):
     return [{"texto": p} for p in partes if p.strip()]
 
 
+A_FAVOR = ("cuenta_verificada", "cifras_comprobadas")  # pistas a favor: solo cuentan en la oración más sospechosa
+
+
 def _respaldo(o):
     vals = [v for v in (o.get("respaldo_por_fuente") or []) if isinstance(v, (int, float))]
     return max(vals) if vals else None
@@ -642,7 +669,7 @@ def reglas_caso(caso, estricto=False):
     """Pistas del caso completo: el máximo de cada pista sobre todas las oraciones
     (una sola afirmación falsa basta, así que no se promedia).
 
-    Excepción: cuenta_verificada es una pista A FAVOR y solo cuenta en la oración
+    Excepción: cuenta_verificada y cifras_comprobadas son pistas A FAVOR y solo cuentan en la oración
     más sospechosa (la de menos respaldo del NLI): que una frase haga bien sus cuentas
     no debe tranquilizar sobre otra frase distinta. Sin datos del NLI, tienen que
     cuadrar las cuentas de todas las oraciones que las hagan.
@@ -661,11 +688,13 @@ def reglas_caso(caso, estricto=False):
         respaldos = [_respaldo(o) for o in oraciones]
         if por_oracion and all(r is not None for r in respaldos):
             peor = min(range(len(oraciones)), key=lambda i: respaldos[i])
-            total["cuenta_verificada"] = por_oracion[peor]["cuenta_verificada"]
+            for k in A_FAVOR:
+                total[k] = por_oracion[peor][k]
         elif por_oracion:
-            con_cuentas = [r["cuenta_verificada"] for r, o in zip(por_oracion, oraciones)
-                           if any(x["tipo"] == "num" for x in extraer_cifras(o.get("texto", "")))]
-            total["cuenta_verificada"] = min(con_cuentas) if con_cuentas else 0.0
+            con_cifras = [r for r, o in zip(por_oracion, oraciones)
+                          if any(x["tipo"] == "num" for x in extraer_cifras(o.get("texto", "")))]
+            for k in A_FAVOR:
+                total[k] = min(r[k] for r in con_cifras) if con_cifras else 0.0
     except Exception:
         if estricto:  # al medir queremos ver el fallo
             raise
@@ -796,17 +825,17 @@ def vector(d, modelo):
 
 # === PARAMETROS (los escribe herramientas/montar_bot.py) ===
 PARAMS = {
-    'completo': {  # corte 0.42 desplazado a 0,5
-        "media": [0.087797, 0.24, 0.025689, 0.387632, 0.317551, 0.050713, 0.130745, 0.041204, 0.041997, 0.038035, 0.024564, 0.032488, 0.034073, 0.043582, 0.010301],
-        "desv": [0.263114, 0.415673, 0.036764, 0.385691, 0.448661, 0.219411, 0.337121, 0.198763, 0.200582, 0.19128, 0.154793, 0.177293, 0.181416, 0.204162, 0.10097],
-        "coef": [1.058842, 2.170544, 0.664897, -0.418675, -0.2285, 0.655825, -0.957813, 0.349434, 0.393197, 0.360301, 0.150477, 0.377837, 0.309631, 0.165688, 0.1619],
-        "sesgo": 2.225781,
+    'completo': {  # corte 0.47 desplazado a 0,5
+        "media": [0.087797, 0.24, 0.025689, 0.387632, 0.317551, 0.050713, 0.130745, 0.558637, 0.041204, 0.041997, 0.038035, 0.024564, 0.032488, 0.034073, 0.043582, 0.010301],
+        "desv": [0.263114, 0.415673, 0.036764, 0.385691, 0.448661, 0.219411, 0.337121, 0.49655, 0.198763, 0.200582, 0.19128, 0.154793, 0.177293, 0.181416, 0.204162, 0.10097],
+        "coef": [1.072418, 2.182479, 0.68199, -0.469759, -0.213793, 0.696034, -1.0118, 0.199529, 0.335045, 0.391264, 0.3724, 0.137308, 0.390353, 0.308232, 0.158296, 0.182012],
+        "sesgo": 2.026925,
     },
-    'sin_llm': {  # corte 0.55 desplazado a 0,5
-        "media": [0.387632, 0.317551, 0.050713, 0.130745, 0.041204, 0.041997, 0.038035, 0.024564, 0.032488, 0.034073, 0.043582, 0.010301],
-        "desv": [0.385691, 0.448661, 0.219411, 0.337121, 0.198763, 0.200582, 0.19128, 0.154793, 0.177293, 0.181416, 0.204162, 0.10097],
-        "coef": [-0.582289, -0.384922, 0.541176, -0.913897, 0.237332, 0.287059, 0.275414, 0.180625, 0.313232, 0.231861, 0.15369, 0.145193],
-        "sesgo": 1.18521,
+    'sin_llm': {  # corte 0.53 desplazado a 0,5
+        "media": [0.387632, 0.317551, 0.050713, 0.130745, 0.558637, 0.041204, 0.041997, 0.038035, 0.024564, 0.032488, 0.034073, 0.043582, 0.010301],
+        "desv": [0.385691, 0.448661, 0.219411, 0.337121, 0.49655, 0.198763, 0.200582, 0.19128, 0.154793, 0.177293, 0.181416, 0.204162, 0.10097],
+        "coef": [-0.604026, -0.37601, 0.563542, -0.940898, 0.109776, 0.239843, 0.283362, 0.280285, 0.175047, 0.320244, 0.228763, 0.147474, 0.155071],
+        "sesgo": 1.262642,
     },
 }
 # === FIN PARAMETROS ===
